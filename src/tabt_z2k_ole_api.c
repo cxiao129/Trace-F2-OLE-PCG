@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "dpf.h"
@@ -20,6 +21,28 @@ struct TabtTraceProgram {
 struct TabtPrg {
     uint64_t s;
 };
+
+struct TabtPublicCache {
+    int valid;
+    size_t n;
+    size_t c;
+    size_t t;
+    uint64_t seed_hash;
+    size_t active;
+    struct Param *param;
+    struct FFT_GR128_Trace_A *pp;
+};
+
+struct TabtPublicBorrow {
+    struct Param *param;
+    struct FFT_GR128_Trace_A *pp;
+    int cached;
+};
+
+static pthread_mutex_t g_public_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct TabtPublicCache g_public_cache = {0};
+
+static void init_tabt_gr128_params(struct Param *param, size_t n, size_t c, size_t t);
 
 static uint64_t splitmix64_next(struct TabtPrg *prg) {
     uint64_t z = (prg->s += 0x9e3779b97f4a7c15ULL);
@@ -195,6 +218,101 @@ static void sample_public_from_seed(
             }
         }
     }
+}
+
+static void free_cached_public_unlocked(void) {
+    if (g_public_cache.valid) {
+        free_FFT_GR128_Trace_A(g_public_cache.param, g_public_cache.pp);
+        free(g_public_cache.param);
+    }
+    memset(&g_public_cache, 0, sizeof(g_public_cache));
+}
+
+static int init_public_objects(size_t n,
+                               size_t c,
+                               size_t t,
+                               const uint8_t *seed,
+                               size_t seed_len,
+                               struct Param **param_out,
+                               struct FFT_GR128_Trace_A **pp_out) {
+    struct Param *param = xcalloc(1, sizeof(struct Param));
+    init_tabt_gr128_params(param, n, c, t);
+    if (param->poly_size % (t * t) != 0 ||
+        param->dpf_block_size * t * t != param->poly_size) {
+        free(param);
+        return -1;
+    }
+
+    struct FFT_GR128_Trace_A *pp = xcalloc(1, sizeof(struct FFT_GR128_Trace_A));
+    init_FFT_GR128_Trace_A(param, pp);
+    sample_public_from_seed(param, pp, seed, seed_len);
+    *param_out = param;
+    *pp_out = pp;
+    return 0;
+}
+
+static int acquire_public(size_t n,
+                          size_t c,
+                          size_t t,
+                          const uint8_t *seed,
+                          size_t seed_len,
+                          struct TabtPublicBorrow *borrow) {
+    const uint64_t seed_hash = seed_bytes(seed, seed_len, 0x70706361636865ULL);
+    pthread_mutex_lock(&g_public_cache_mu);
+    const int hit = g_public_cache.valid &&
+        g_public_cache.n == n &&
+        g_public_cache.c == c &&
+        g_public_cache.t == t &&
+        g_public_cache.seed_hash == seed_hash;
+    if (hit) {
+        ++g_public_cache.active;
+        borrow->param = g_public_cache.param;
+        borrow->pp = g_public_cache.pp;
+        borrow->cached = 1;
+        pthread_mutex_unlock(&g_public_cache_mu);
+        return 0;
+    }
+    if (g_public_cache.active != 0) {
+        pthread_mutex_unlock(&g_public_cache_mu);
+        if (init_public_objects(n, c, t, seed, seed_len, &borrow->param, &borrow->pp) != 0) {
+            return -1;
+        }
+        borrow->cached = 0;
+        return 0;
+    }
+
+    free_cached_public_unlocked();
+    if (init_public_objects(n, c, t, seed, seed_len, &g_public_cache.param, &g_public_cache.pp) != 0) {
+        pthread_mutex_unlock(&g_public_cache_mu);
+        return -1;
+    }
+    g_public_cache.valid = 1;
+    g_public_cache.n = n;
+    g_public_cache.c = c;
+    g_public_cache.t = t;
+    g_public_cache.seed_hash = seed_hash;
+    g_public_cache.active = 1;
+    borrow->param = g_public_cache.param;
+    borrow->pp = g_public_cache.pp;
+    borrow->cached = 1;
+    pthread_mutex_unlock(&g_public_cache_mu);
+    return 0;
+}
+
+static void release_public(struct TabtPublicBorrow *borrow) {
+    if (!borrow->cached) {
+        free_FFT_GR128_Trace_A(borrow->param, borrow->pp);
+        free(borrow->param);
+    } else {
+        pthread_mutex_lock(&g_public_cache_mu);
+        if (g_public_cache.active > 0) {
+            --g_public_cache.active;
+        }
+        pthread_mutex_unlock(&g_public_cache_mu);
+    }
+    borrow->param = NULL;
+    borrow->pp = NULL;
+    borrow->cached = 0;
 }
 
 static void init_program(
@@ -597,16 +715,12 @@ int tabt_z2k_ole_generate(
         return -1;
     }
 
-    struct Param *param = xcalloc(1, sizeof(struct Param));
-    init_tabt_gr128_params(param, n, c, t);
-    if (param->poly_size % (t * t) != 0 || param->dpf_block_size * t * t != param->poly_size) {
-        free(param);
+    struct TabtPublicBorrow public_borrow = {0};
+    if (acquire_public(n, c, t, pp_seed, pp_seed_len, &public_borrow) != 0) {
         return -2;
     }
-
-    struct FFT_GR128_Trace_A *pp = xcalloc(1, sizeof(struct FFT_GR128_Trace_A));
-    init_FFT_GR128_Trace_A(param, pp);
-    sample_public_from_seed(param, pp, pp_seed, pp_seed_len);
+    struct Param *param = public_borrow.param;
+    struct FFT_GR128_Trace_A *pp = public_borrow.pp;
 
     struct TabtTraceProgram recv_program = {0};
     struct TabtTraceProgram send_program = {0};
@@ -662,8 +776,7 @@ int tabt_z2k_ole_generate(
     free(send_fft);
     free_program(&recv_program);
     free_program(&send_program);
-    free_FFT_GR128_Trace_A(param, pp);
-    free(param);
+    release_public(&public_borrow);
 
     return failures == 0 ? 0 : 1;
 }
