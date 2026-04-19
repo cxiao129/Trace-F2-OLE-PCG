@@ -23,6 +23,7 @@
 #include "mal128_trace_f4_bench.h"
 #include "mal128_trace_f16_bench.h"
 #include "common.h"
+#include "utils.h"
 
 void printUsage() {
     printf("Usage: ./pcg [OPTIONS]\n");
@@ -274,6 +275,17 @@ void run_test_pcg(test_pcg_func tpf) {
 
 int main(int argc, char **argv)
 {
+    if (argc >= 5 && strcmp(argv[1], "--gr128_trace_once") == 0) {
+        size_t n = strtoull(argv[2], NULL, 10);
+        size_t c = strtoull(argv[3], NULL, 10);
+        size_t t = strtoull(argv[4], NULL, 10);
+        struct PCG_Time pcg_time;
+        gr128_trace_bench_pcg(n, c, t, &pcg_time);
+        printf("trace_pcg_result n=%zu c=%zu t=%zu capacity=%zu setup_ms=%0.4f expand_ms=%0.4f total_ms=%0.4f\n",
+               n, c, t, ipow(3, n), pcg_time.pp_time, pcg_time.expand_time, pcg_time.total_time);
+        return 0;
+    }
+
     int num_trials = 10;
 
     for (int i = 1; i < argc; i++) {
