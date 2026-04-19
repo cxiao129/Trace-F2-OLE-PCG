@@ -42,6 +42,7 @@ int tabt_z2k_ole_generate(
     uint64_t *delta_out,
     uint64_t *q_out,
     uint64_t *t_out,
+    int verify_relation,
     struct TabtZ2kOleStats *stats);
 
 #ifdef __cplusplus

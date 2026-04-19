@@ -589,6 +589,7 @@ int tabt_z2k_ole_generate(
     uint64_t *delta_out,
     uint64_t *q_out,
     uint64_t *t_out,
+    int verify_relation,
     struct TabtZ2kOleStats *stats) {
     if (!validate_params(n, c, t, count) || pp_seed == NULL || recv_seed == NULL ||
         send_seed == NULL || x_out == NULL || delta_out == NULL || q_out == NULL ||
@@ -637,10 +638,14 @@ int tabt_z2k_ole_generate(
     free(share_recv);
     free(share_send);
 
+    uint64_t checked = 0;
     uint64_t failures = 0;
-    for (uint64_t i = 0; i < count; ++i) {
-        if ((uint64_t)(q_out[i] - t_out[i]) != (uint64_t)(x_out[i] * delta_out[i])) {
-            ++failures;
+    if (verify_relation) {
+        checked = count;
+        for (uint64_t i = 0; i < count; ++i) {
+            if ((uint64_t)(q_out[i] - t_out[i]) != (uint64_t)(x_out[i] * delta_out[i])) {
+                ++failures;
+            }
         }
     }
 
@@ -649,7 +654,7 @@ int tabt_z2k_ole_generate(
         stats->c = c;
         stats->t = t;
         stats->capacity = param->poly_size;
-        stats->checked = count;
+        stats->checked = checked;
         stats->failures = failures;
     }
 
